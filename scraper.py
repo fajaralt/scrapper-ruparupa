@@ -69,8 +69,25 @@ def scrape_ruparupa():
 
     for card in cards:
         card_text = card.get_text(" ", strip=True)
+        card_text = re.sub(r"[\u200b-\u200d\ufeff]", "", card_text)
         lower_card_text = card_text.lower()
         if "kursi" not in lower_card_text:
+            continue
+
+        discount_match = re.search(
+            r"\b\d+(?:[.,]\d+)?\s*%",
+            card_text,
+        )
+        has_promo_label = bool(
+            re.search(
+                r"\b(buy\s*1\s*get\s*1|beli\s*1\s*gratis\s*1)\b",
+                lower_card_text,
+                flags=re.IGNORECASE,
+            )
+        )
+        has_discount_price = len(re.findall(r"Rp\s*[\d.]+", card_text)) >= 2
+
+        if has_promo_label and not discount_match and not has_discount_price:
             continue
 
         href = card.get("href")
@@ -99,7 +116,6 @@ def scrape_ruparupa():
             original_price = None
             current_price = None
 
-        discount_match = re.search(r"\b\d+(?:[.,]\d+)?%\b", card_text)
         discount = discount_match.group() if discount_match else "0%"
 
         rating_match = re.search(

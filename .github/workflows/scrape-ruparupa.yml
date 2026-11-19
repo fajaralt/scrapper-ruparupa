@@ -2,7 +2,10 @@ name: Daily RupaRupa Product Scraper
 
 on:
   schedule:
-    - cron: "0 17 * * *"
+    - cron: "0 17 * * *" # 00:00 WIB
+    - cron: "0 23 * * *" # 06:00 WIB
+    - cron: "0 5 * * *"  # 12:00 WIB
+    - cron: "0 11 * * *" # 18:00 WIB
   workflow_dispatch:
 
 permissions:
