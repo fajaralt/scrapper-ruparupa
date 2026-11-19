@@ -7,6 +7,11 @@ import pandas as pd
 from bs4 import BeautifulSoup
 from playwright.sync_api import sync_playwright
 
+try:
+    from supabase import create_client
+except ImportError:
+    create_client = None
+
 
 OUTPUT_CSV_FILE = "ruparupa_products.csv"
 MAX_SCROLLS = 5
@@ -601,7 +606,86 @@ def append_to_csv(dataframe):
     )
 
 
+def normalize_supabase_row(row):
+    record = {}
+    integer_columns = {"original_price", "current_price", "review_count"}
+    float_columns = {"rating"}
+
+    for column in CSV_COLUMNS:
+        value = row.get(column)
+        if value is None or pd.isna(value):
+            record[column] = None
+            continue
+
+        if column in integer_columns:
+            try:
+                record[column] = int(value)
+            except (TypeError, ValueError, OverflowError):
+                record[column] = None
+            continue
+
+        if column in float_columns:
+            try:
+                record[column] = float(value)
+            except (TypeError, ValueError, OverflowError):
+                record[column] = None
+            continue
+
+        if column == "scraped_at":
+            try:
+                timestamp = pd.Timestamp(str(value).strip())
+                if timestamp.tzinfo is None:
+                    timestamp = timestamp.tz_localize("Asia/Jakarta")
+                record[column] = timestamp.isoformat()
+            except (TypeError, ValueError, OverflowError):
+                record[column] = None
+            continue
+
+        text = str(value).strip()
+        record[column] = text if text and text.lower() != "nan" else None
+
+    return record
+
+
+def insert_to_supabase(dataframe):
+    supabase_url = os.getenv("SUPABASE_URL")
+    supabase_key = os.getenv("SUPABASE_KEY")
+
+    if not supabase_url or not supabase_key:
+        print(
+            "Supabase skipped: SUPABASE_URL and SUPABASE_KEY are not set."
+        )
+        return 0
+
+    if create_client is None:
+        raise RuntimeError(
+            "Supabase client is unavailable. Install dependencies from requirements.txt."
+        )
+
+    records = [
+        normalize_supabase_row(row)
+        for row in dataframe.reindex(columns=CSV_COLUMNS).to_dict("records")
+        if row.get("product_id") is not None
+    ]
+    if not records:
+        print("Supabase skipped: no records to insert.")
+        return 0
+
+    client = create_client(supabase_url, supabase_key)
+    batch_size = 500
+    for start in range(0, len(records), batch_size):
+        batch = records[start:start + batch_size]
+        client.table("ruparupa_products").upsert(
+            batch,
+            on_conflict="product_id",
+        ).execute()
+
+    print(f"Upserted {len(records)} rows to Supabase.")
+    return len(records)
+
+
 if __name__ == "__main__":
     products = scrape_ruparupa()
     append_to_csv(products)
+    insert_to_supabase(products)
     print(products.head())

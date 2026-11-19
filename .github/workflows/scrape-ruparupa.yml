@@ -48,6 +48,8 @@ jobs:
           RUPARUPA_CATEGORY_BATCH_SIZE: "10"
           RUPARUPA_CATEGORY_BATCH_INDEX: ${{ inputs.batch_index || '0' }}
           RUPARUPA_CATEGORY_URLS: ${{ inputs.category_urls || '' }}
+          SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
+          SUPABASE_KEY: ${{ secrets.SUPABASE_KEY }}
         run: python -u scraper.py
 
       - name: Commit scraped data
