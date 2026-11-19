@@ -9,11 +9,12 @@ from playwright.sync_api import sync_playwright
 
 
 OUTPUT_CSV_FILE = "ruparupa_products.csv"
-MAX_SCROLLS = 10
+MAX_SCROLLS = 5
 STABLE_SCROLLS_TO_STOP = 2
 MAX_PAGES = 100
 SCROLL_DISTANCE = 2000
 SCROLL_WAIT_MS = 2000
+MAX_CATEGORIES_PER_RUN = 10
 BASE_URL = "https://www.ruparupa.com"
 CATEGORY_INDEX_URL = f"{BASE_URL}/c/"
 
@@ -202,7 +203,7 @@ def load_page(page, page_url):
     if not response or response.status >= 400:
         status = response.status if response else "none"
         raise RuntimeError(f"Page could not be loaded. HTTP status: {status}")
-    page.wait_for_timeout(5000)
+    page.wait_for_timeout(3000)
 
 
 def scrape_ruparupa():
@@ -243,6 +244,54 @@ def scrape_ruparupa():
                     f"{CATEGORY_INDEX_URL}. Set RUPARUPA_CATEGORY_URLS "
                     "with one or more explicit category URLs."
                 )
+
+        batch_size = MAX_CATEGORIES_PER_RUN
+        batch_size_override = os.getenv("RUPARUPA_CATEGORY_BATCH_SIZE", "")
+        if batch_size_override:
+            try:
+                batch_size = min(
+                    int(batch_size_override),
+                    MAX_CATEGORIES_PER_RUN,
+                )
+            except ValueError as error:
+                raise RuntimeError(
+                    "RUPARUPA_CATEGORY_BATCH_SIZE must be an integer."
+                ) from error
+            if batch_size < 1:
+                raise RuntimeError(
+                    "RUPARUPA_CATEGORY_BATCH_SIZE must be at least 1."
+                )
+
+        batch_index_text = os.getenv(
+            "RUPARUPA_CATEGORY_BATCH_INDEX",
+            "0",
+        )
+        try:
+            batch_index = int(batch_index_text)
+        except ValueError as error:
+            raise RuntimeError(
+                "RUPARUPA_CATEGORY_BATCH_INDEX must be an integer."
+            ) from error
+        if batch_index < 0:
+            raise RuntimeError(
+                "RUPARUPA_CATEGORY_BATCH_INDEX cannot be negative."
+            )
+
+        total_categories = len(category_urls)
+        batch_start = batch_index * batch_size
+        category_urls = category_urls[batch_start:batch_start + batch_size]
+        if not category_urls:
+            raise RuntimeError(
+                f"No categories found for batch index {batch_index} "
+                f"with batch size {batch_size}. "
+                "Choose another batch index."
+            )
+
+        print(
+            f"Running category batch {batch_index + 1}; "
+            f"processing {len(category_urls)} of {total_categories} "
+            "available URLs."
+        )
 
         page_snapshots = []
         for category_number, category_url in enumerate(category_urls, start=1):
