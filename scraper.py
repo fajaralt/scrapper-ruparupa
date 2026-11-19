@@ -1,7 +1,7 @@
 import os
 import re
 from datetime import datetime, timedelta, timezone
-from urllib.parse import urljoin
+from urllib.parse import urljoin, urlsplit, urlunsplit
 
 import pandas as pd
 from bs4 import BeautifulSoup
@@ -28,13 +28,12 @@ def extract_number(text):
 
 
 def product_cards(soup):
-    cards = soup.select("a[href*='/p/']")
+    cards = soup.select(".product-card a[href*='/p/']")
     if cards:
         return cards
     return soup.select(
-        "[data-product-id] a[href], "
-        "[data-testid*='product'] a[href], "
-        "[class*='product-card'] a[href]"
+        "[data-product-id] a[href*='/p/'], "
+        "[data-testid*='product'] a[href*='/p/']"
     )
 
 
@@ -78,6 +77,62 @@ def discover_category_urls(soup):
     return sorted(category_urls)
 
 
+def normalize_product_url(url):
+    if not isinstance(url, str) or not url:
+        return None
+    absolute_url = urljoin(BASE_URL, url)
+    parts = urlsplit(absolute_url)
+    if "/p/" not in parts.path:
+        return absolute_url
+    return urlunsplit((parts.scheme, parts.netloc, parts.path, "", ""))
+
+
+def clean_product_name(name):
+    if not isinstance(name, str) or not name:
+        return "N/A"
+    name = re.sub(r"[\u200b-\u200d\ufeff]", "", name)
+    name = name.strip()
+    name = re.sub(
+        r"^(?:\d+\s+Tipe\s+|\d+\s+Var\s+Warna\s+)",
+        "",
+        name,
+        flags=re.IGNORECASE,
+    )
+    name = re.sub(r"\bHanya\s*$", "", name, flags=re.IGNORECASE)
+    name = re.sub(r"\s+", " ", name).strip()
+    return name or "N/A"
+
+
+def clean_image_url(card):
+    for image_element in card.select("img[src], img[data-src], img[data-original]"):
+        image_url = (
+            image_element.get("src")
+            or image_element.get("data-src")
+            or image_element.get("data-original")
+        )
+        if not image_url:
+            continue
+        absolute_url = urljoin(BASE_URL, image_url)
+        lower_url = absolute_url.lower()
+        if lower_url.endswith(".svg") or "/icon/" in lower_url:
+            continue
+        if "ruparupa" not in lower_url:
+            continue
+        if "/products/" not in lower_url:
+            continue
+        return absolute_url
+    return None
+
+
+def normalize_discount(discount):
+    if not discount:
+        return "0%"
+    match = re.search(r"\d+(?:[.,]\d+)?", str(discount))
+    if not match:
+        return "0%"
+    return f"{match.group().replace(',', '.')}%"
+
+
 def first_text(element, selectors):
     for selector in selectors:
         candidate = element.select_one(selector)
@@ -119,14 +174,16 @@ def extract_product_name(card, card_text):
         ),
     )
     if name:
-        return name
+        return clean_product_name(name)
 
     name_match = re.search(
         r"^(?:\d+\s+Var\s+Warna\s+)?(.+?)\s+Rp\s*[\d.]",
         card_text,
         flags=re.IGNORECASE,
     )
-    return name_match.group(1).strip() if name_match else "N/A"
+    if name_match:
+        return clean_product_name(name_match.group(1))
+    return "N/A"
 
 
 def extract_prices(card):
@@ -342,7 +399,9 @@ def scrape_ruparupa():
             if not href:
                 continue
 
-            product_url = urljoin(BASE_URL, href)
+            product_url = normalize_product_url(href)
+            if not product_url:
+                continue
             if product_url in seen_urls:
                 continue
             seen_urls.add(product_url)
@@ -350,7 +409,9 @@ def scrape_ruparupa():
             name = extract_product_name(card, card_text)
             original_price, current_price = extract_prices(card)
 
-            discount = discount_match.group() if discount_match else "0%"
+            discount = normalize_discount(
+                discount_match.group() if discount_match else "0%"
+            )
 
             rating_match = re.search(
                 r"\b([1-5](?:[.,]\d)?)\b\s+(\d+(?:[.,]\d+)?)\s*\(ulasan\)",
@@ -364,16 +425,7 @@ def scrape_ruparupa():
             review_match = re.search(r"\b(\d+)\s*\(ulasan\)", card_text)
             review_count = int(review_match.group(1)) if review_match else None
 
-            image_element = card.select_one("img")
-            image_url = None
-            if image_element:
-                image_url = (
-                    image_element.get("src")
-                    or image_element.get("data-src")
-                    or image_element.get("data-original")
-                )
-                if image_url:
-                    image_url = urljoin(BASE_URL, image_url)
+            image_url = clean_image_url(card)
 
             lower_text = card_text.lower()
             if "habis" in lower_text or "out of stock" in lower_text:
@@ -407,15 +459,57 @@ def scrape_ruparupa():
 
 
 def append_to_csv(dataframe):
-    file_exists = os.path.isfile(OUTPUT_CSV_FILE)
-    dataframe.to_csv(
+    dataframe = dataframe.copy()
+    if "url" in dataframe.columns:
+        dataframe["url"] = dataframe["url"].map(normalize_product_url)
+        dataframe["name"] = dataframe["name"].map(clean_product_name)
+        dataframe["discount"] = dataframe["discount"].map(normalize_discount)
+        dataframe = dataframe.dropna(subset=["url"])
+
+    if os.path.isfile(OUTPUT_CSV_FILE):
+        existing = pd.read_csv(OUTPUT_CSV_FILE)
+        if "url" in existing.columns:
+            existing["url"] = existing["url"].map(normalize_product_url)
+            existing["name"] = existing["name"].map(clean_product_name)
+            existing["discount"] = existing["discount"].map(normalize_discount)
+            if "image_url" in existing.columns:
+                existing["image_url"] = existing["image_url"].map(
+                    lambda value: (
+                        value
+                        if isinstance(value, str)
+                        and value.lower().startswith("http")
+                        and "ruparupa" in value.lower()
+                        and not value.lower().endswith(".svg")
+                        and "/icon/" not in value.lower()
+                        and "/products/" in value.lower()
+                        else None
+                    )
+                )
+            existing = existing.dropna(subset=["url"])
+            if dataframe.empty:
+                combined = existing
+            else:
+                combined = pd.concat([existing, dataframe], ignore_index=True)
+            combined = combined.drop_duplicates(
+                subset=["url"],
+                keep="last",
+            )
+        else:
+            combined = dataframe
+    else:
+        combined = dataframe
+
+    combined = combined.sort_values(
+        ["source_category", "name"],
+        na_position="last",
+    )
+    combined.to_csv(
         OUTPUT_CSV_FILE,
-        mode="a",
-        header=not file_exists,
         index=False,
         encoding="utf-8-sig",
     )
-    print(f"Appended {len(dataframe)} rows to {OUTPUT_CSV_FILE}")
+    print(f"Merged {len(dataframe)} rows into {OUTPUT_CSV_FILE}; "
+          f"{len(combined)} unique rows")
 
 
 if __name__ == "__main__":
