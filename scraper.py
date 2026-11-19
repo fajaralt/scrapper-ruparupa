@@ -19,7 +19,6 @@ BASE_URL = "https://www.ruparupa.com"
 CATEGORY_INDEX_URL = f"{BASE_URL}/c/"
 CSV_COLUMNS = [
     "product_id",
-    "sku",
     "name",
     "brand",
     "category",
@@ -457,16 +456,17 @@ def scrape_ruparupa():
             if not href:
                 continue
 
-            sku = extract_sku(urljoin(BASE_URL, href))
+            product_id = extract_sku(urljoin(BASE_URL, href))
             product_url = normalize_product_url(href)
             if not product_url:
                 continue
-            if product_url in seen_urls:
+            if not product_id:
                 continue
-            seen_urls.add(product_url)
+            if product_id in seen_urls:
+                continue
+            seen_urls.add(product_id)
 
             name = extract_product_name(card, card_text)
-            product_id = extract_product_id(product_url)
             category, subcategory = category_fields(source_category)
             brand = extract_brand(name)
             original_price, current_price = extract_prices(card)
@@ -497,7 +497,6 @@ def scrape_ruparupa():
 
             rows.append({
                 "product_id": product_id,
-                "sku": sku,
                 "name": name,
                 "brand": brand,
                 "category": category,
@@ -524,18 +523,24 @@ def append_to_csv(dataframe):
     dataframe = dataframe.copy()
     dataframe["name"] = dataframe["name"].map(clean_product_name)
     dataframe["discount"] = dataframe["discount"].map(normalize_discount)
+    dataframe["product_id"] = dataframe["product_id"].map(
+        lambda value: str(value).strip()
+        if pd.notna(value) and str(value).strip().lower() != "nan"
+        else None
+    )
 
     if os.path.isfile(OUTPUT_CSV_FILE):
         existing = pd.read_csv(OUTPUT_CSV_FILE)
-        if "product_id" not in existing.columns:
+        if "sku" in existing.columns:
+            existing["product_id"] = existing["sku"]
+        elif "url" in existing.columns:
             existing["url"] = existing.get(
                 "url",
                 pd.Series([None] * len(existing)),
             )
-            existing["product_id"] = existing["url"].map(
-                normalize_product_url
-            ).map(extract_product_id)
-            existing["sku"] = existing["url"].map(extract_sku)
+            existing["product_id"] = existing["url"].map(extract_sku)
+
+        if "url" in existing.columns:
             existing["name"] = existing["name"].map(clean_product_name)
             existing["brand"] = existing["name"].map(extract_brand)
             category_pairs = existing.get(
@@ -554,6 +559,11 @@ def append_to_csv(dataframe):
         existing["name"] = existing["name"].map(clean_product_name)
         existing["brand"] = existing["name"].map(extract_brand)
         existing["discount"] = existing["discount"].map(normalize_discount)
+        existing["product_id"] = existing["product_id"].map(
+            lambda value: str(value).strip()
+            if pd.notna(value) and str(value).strip().lower() != "nan"
+            else None
+        )
         existing = existing.reindex(columns=CSV_COLUMNS)
 
         if dataframe.empty:
