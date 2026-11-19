@@ -46,9 +46,9 @@ jobs:
       - name: Run scraper
         env:
           RUPARUPA_CATEGORY_BATCH_SIZE: "10"
-          RUPARUPA_CATEGORY_BATCH_INDEX: ${{ github.event_name == 'workflow_dispatch' && inputs.batch_index || github.run_number % 20 }}
+          RUPARUPA_CATEGORY_BATCH_INDEX: ${{ inputs.batch_index || '0' }}
           RUPARUPA_CATEGORY_URLS: ${{ inputs.category_urls || '' }}
-        run: python scraper.py
+        run: python -u scraper.py
 
       - name: Commit scraped data
         run: |
