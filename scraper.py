@@ -1,7 +1,7 @@
 import os
 import re
 from datetime import datetime, timedelta, timezone
-from urllib.parse import urljoin, urlsplit, urlunsplit
+from urllib.parse import parse_qs, urljoin, urlsplit, urlunsplit
 
 import pandas as pd
 from bs4 import BeautifulSoup
@@ -17,6 +17,22 @@ SCROLL_WAIT_MS = 2000
 MAX_CATEGORIES_PER_RUN = 10
 BASE_URL = "https://www.ruparupa.com"
 CATEGORY_INDEX_URL = f"{BASE_URL}/c/"
+CSV_COLUMNS = [
+    "product_id",
+    "sku",
+    "name",
+    "brand",
+    "category",
+    "subcategory",
+    "original_price",
+    "current_price",
+    "discount",
+    "promotion",
+    "stock_status",
+    "rating",
+    "review_count",
+    "scraped_at",
+]
 
 
 def extract_number(text):
@@ -87,13 +103,55 @@ def normalize_product_url(url):
     return urlunsplit((parts.scheme, parts.netloc, parts.path, "", ""))
 
 
+def extract_product_id(product_url):
+    if not isinstance(product_url, str):
+        return None
+    path = urlsplit(urljoin(BASE_URL, product_url)).path
+    filename = path.rsplit("/", 1)[-1]
+    if filename.endswith(".html"):
+        filename = filename[:-5]
+    return filename or None
+
+
+def extract_sku(product_url):
+    if not isinstance(product_url, str):
+        return None
+    return parse_qs(urlsplit(product_url).query).get("itm_term", [None])[0]
+
+
+def category_fields(source_category):
+    if not isinstance(source_category, str):
+        return None, None
+    segments = [
+        segment
+        for segment in urlsplit(source_category).path.split("/")
+        if segment and segment != "c"
+    ]
+    if not segments:
+        return None, None
+    category = segments[0].replace("-", " ").strip().title()
+    subcategory = (
+        segments[-1].replace("-", " ").strip().title()
+        if len(segments) > 1
+        else category
+    )
+    return category, subcategory
+
+
+def extract_brand(name):
+    if not isinstance(name, str) or name == "N/A":
+        return None
+    words = name.split()
+    return words[0].strip() if words else None
+
+
 def clean_product_name(name):
     if not isinstance(name, str) or not name:
         return "N/A"
     name = re.sub(r"[\u200b-\u200d\ufeff]", "", name)
     name = name.strip()
     name = re.sub(
-        r"^(?:\d+\s+Tipe\s+|\d+\s+Var\s+Warna\s+)",
+        r"^(?:\d+\s+(?:Tipe|Ukuran|Var\s+Warna)\s+)",
         "",
         name,
         flags=re.IGNORECASE,
@@ -399,6 +457,7 @@ def scrape_ruparupa():
             if not href:
                 continue
 
+            sku = extract_sku(urljoin(BASE_URL, href))
             product_url = normalize_product_url(href)
             if not product_url:
                 continue
@@ -407,6 +466,9 @@ def scrape_ruparupa():
             seen_urls.add(product_url)
 
             name = extract_product_name(card, card_text)
+            product_id = extract_product_id(product_url)
+            category, subcategory = category_fields(source_category)
+            brand = extract_brand(name)
             original_price, current_price = extract_prices(card)
 
             discount = normalize_discount(
@@ -425,8 +487,6 @@ def scrape_ruparupa():
             review_match = re.search(r"\b(\d+)\s*\(ulasan\)", card_text)
             review_count = int(review_match.group(1)) if review_match else None
 
-            image_url = clean_image_url(card)
-
             lower_text = card_text.lower()
             if "habis" in lower_text or "out of stock" in lower_text:
                 stock_status = "Out of stock"
@@ -436,18 +496,20 @@ def scrape_ruparupa():
                 stock_status = "Available"
 
             rows.append({
-                "scraped_at": scraped_at,
-                "source_category": source_category,
+                "product_id": product_id,
+                "sku": sku,
                 "name": name,
+                "brand": brand,
+                "category": category,
+                "subcategory": subcategory,
                 "original_price": original_price,
                 "current_price": current_price,
                 "discount": discount,
                 "promotion": "Buy 1 Get 1" if has_promo_label else None,
+                "stock_status": stock_status,
                 "rating": rating,
                 "review_count": review_count,
-                "stock_status": stock_status,
-                "url": product_url,
-                "image_url": image_url,
+                "scraped_at": scraped_at,
             })
 
     if not rows:
@@ -455,61 +517,78 @@ def scrape_ruparupa():
             "No products found. The page structure or product URL may have changed."
         )
 
-    return pd.DataFrame(rows)
+    return pd.DataFrame(rows).reindex(columns=CSV_COLUMNS)
 
 
 def append_to_csv(dataframe):
     dataframe = dataframe.copy()
-    if "url" in dataframe.columns:
-        dataframe["url"] = dataframe["url"].map(normalize_product_url)
-        dataframe["name"] = dataframe["name"].map(clean_product_name)
-        dataframe["discount"] = dataframe["discount"].map(normalize_discount)
-        dataframe = dataframe.dropna(subset=["url"])
+    dataframe["name"] = dataframe["name"].map(clean_product_name)
+    dataframe["discount"] = dataframe["discount"].map(normalize_discount)
 
     if os.path.isfile(OUTPUT_CSV_FILE):
         existing = pd.read_csv(OUTPUT_CSV_FILE)
-        if "url" in existing.columns:
-            existing["url"] = existing["url"].map(normalize_product_url)
-            existing["name"] = existing["name"].map(clean_product_name)
-            existing["discount"] = existing["discount"].map(normalize_discount)
-            if "image_url" in existing.columns:
-                existing["image_url"] = existing["image_url"].map(
-                    lambda value: (
-                        value
-                        if isinstance(value, str)
-                        and value.lower().startswith("http")
-                        and "ruparupa" in value.lower()
-                        and not value.lower().endswith(".svg")
-                        and "/icon/" not in value.lower()
-                        and "/products/" in value.lower()
-                        else None
-                    )
-                )
-            existing = existing.dropna(subset=["url"])
-            if dataframe.empty:
-                combined = existing
-            else:
-                combined = pd.concat([existing, dataframe], ignore_index=True)
-            combined = combined.drop_duplicates(
-                subset=["url"],
-                keep="last",
+        if "product_id" not in existing.columns:
+            existing["url"] = existing.get(
+                "url",
+                pd.Series([None] * len(existing)),
             )
-        else:
-            combined = dataframe
-    else:
-        combined = dataframe
+            existing["product_id"] = existing["url"].map(
+                normalize_product_url
+            ).map(extract_product_id)
+            existing["sku"] = existing["url"].map(extract_sku)
+            existing["name"] = existing["name"].map(clean_product_name)
+            existing["brand"] = existing["name"].map(extract_brand)
+            category_pairs = existing.get(
+                "source_category",
+                pd.Series([None] * len(existing)),
+            ).map(category_fields)
+            existing["category"] = category_pairs.map(
+                lambda value: value[0] if value else None
+            )
+            existing["subcategory"] = category_pairs.map(
+                lambda value: value[1] if value else None
+            )
+            existing["discount"] = existing["discount"].map(normalize_discount)
+            existing = existing.reindex(columns=CSV_COLUMNS)
 
+        existing["name"] = existing["name"].map(clean_product_name)
+        existing["brand"] = existing["name"].map(extract_brand)
+        existing["discount"] = existing["discount"].map(normalize_discount)
+        existing = existing.reindex(columns=CSV_COLUMNS)
+
+        if dataframe.empty:
+            combined = existing
+        else:
+            combined = pd.concat(
+                [existing, dataframe.reindex(columns=CSV_COLUMNS)],
+                ignore_index=True,
+            )
+        combined = combined.drop_duplicates(
+            subset=["product_id"],
+            keep="last",
+        )
+        combined = combined.dropna(subset=["product_id"])
+    else:
+        combined = dataframe.reindex(columns=CSV_COLUMNS)
+
+    combined = combined.drop_duplicates(
+        subset=["product_id"],
+        keep="last",
+    )
     combined = combined.sort_values(
-        ["source_category", "name"],
+        ["category", "subcategory", "name"],
         na_position="last",
     )
+    combined = combined.reindex(columns=CSV_COLUMNS)
     combined.to_csv(
         OUTPUT_CSV_FILE,
         index=False,
         encoding="utf-8-sig",
     )
-    print(f"Merged {len(dataframe)} rows into {OUTPUT_CSV_FILE}; "
-          f"{len(combined)} unique rows")
+    print(
+        f"Merged {len(dataframe)} rows into {OUTPUT_CSV_FILE}; "
+        f"{len(combined)} unique rows"
+    )
 
 
 if __name__ == "__main__":
