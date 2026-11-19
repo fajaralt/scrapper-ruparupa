@@ -8,10 +8,6 @@ from bs4 import BeautifulSoup
 from playwright.sync_api import sync_playwright
 
 
-CATEGORY_URL = (
-    "https://www.ruparupa.com/c/barang-wajib-untuk-setiap-ruangan/"
-    "ruang-kerja/kursi-kerja.html"
-)
 OUTPUT_CSV_FILE = "ruparupa_products.csv"
 MAX_SCROLLS = 10
 STABLE_SCROLLS_TO_STOP = 2
@@ -19,6 +15,7 @@ MAX_PAGES = 100
 SCROLL_DISTANCE = 2000
 SCROLL_WAIT_MS = 2000
 BASE_URL = "https://www.ruparupa.com"
+CATEGORY_INDEX_URL = f"{BASE_URL}/c/"
 
 
 def extract_number(text):
@@ -68,6 +65,16 @@ def next_page_url(soup, current_url):
         if label in {"next", "berikutnya", "selanjutnya", "›", "»"}:
             return urljoin(current_url, link["href"])
     return None
+
+
+def discover_category_urls(soup):
+    category_urls = set()
+    for link in soup.select("a[href]"):
+        href = link.get("href", "")
+        absolute_url = urljoin(BASE_URL, href)
+        if absolute_url.startswith(f"{BASE_URL}/c/") and absolute_url != CATEGORY_INDEX_URL:
+            category_urls.add(absolute_url)
+    return sorted(category_urls)
 
 
 def first_text(element, selectors):
@@ -186,6 +193,18 @@ def scrape_page(page):
     return BeautifulSoup(page.content(), "html.parser")
 
 
+def load_page(page, page_url):
+    response = page.goto(
+        page_url,
+        wait_until="domcontentloaded",
+        timeout=60000,
+    )
+    if not response or response.status >= 400:
+        status = response.status if response else "none"
+        raise RuntimeError(f"Page could not be loaded. HTTP status: {status}")
+    page.wait_for_timeout(5000)
+
+
 def scrape_ruparupa():
     rows = []
 
@@ -202,32 +221,48 @@ def scrape_ruparupa():
         )
         page = context.new_page()
 
-        page_url = CATEGORY_URL
-        page_snapshots = []
-        visited_pages = set()
-        for page_number in range(MAX_PAGES):
-            if page_url in visited_pages:
-                break
-            visited_pages.add(page_url)
-
-            response = page.goto(
-                page_url,
-                wait_until="domcontentloaded",
-                timeout=60000,
-            )
-            if not response or response.status >= 400:
-                status = response.status if response else "none"
+        configured_categories = os.getenv("RUPARUPA_CATEGORY_URLS", "")
+        if configured_categories:
+            category_urls = [
+                url.strip()
+                for url in configured_categories.split(",")
+                if url.strip()
+            ]
+            if not category_urls:
                 raise RuntimeError(
-                    f"Page could not be loaded. HTTP status: {status}"
+                    "RUPARUPA_CATEGORY_URLS is set but contains no category URL."
+                )
+        else:
+            load_page(page, CATEGORY_INDEX_URL)
+            category_urls = discover_category_urls(
+                BeautifulSoup(page.content(), "html.parser")
+            )
+            if not category_urls:
+                raise RuntimeError(
+                    "No category URLs found on "
+                    f"{CATEGORY_INDEX_URL}. Set RUPARUPA_CATEGORY_URLS "
+                    "with one or more explicit category URLs."
                 )
 
-            page.wait_for_timeout(5000)
-            soup = scrape_page(page)
-            page_snapshots.append(soup)
-            page_url = next_page_url(soup, page.url)
-            if not page_url:
-                break
-            print(f"Reading pagination page {page_number + 2}/{MAX_PAGES}")
+        page_snapshots = []
+        for category_number, category_url in enumerate(category_urls, start=1):
+            page_url = category_url
+            visited_pages = set()
+            for page_number in range(MAX_PAGES):
+                if page_url in visited_pages:
+                    break
+                visited_pages.add(page_url)
+
+                load_page(page, page_url)
+                soup = scrape_page(page)
+                page_snapshots.append((soup, category_url))
+                page_url = next_page_url(soup, page.url)
+                if not page_url:
+                    break
+                print(
+                    f"Reading category {category_number}/{len(category_urls)}, "
+                    f"page {page_number + 2}/{MAX_PAGES}"
+                )
         browser.close()
 
     scraped_at = datetime.now(
@@ -236,13 +271,11 @@ def scrape_ruparupa():
 
     seen_urls = set()
 
-    for soup in page_snapshots:
+    for soup, source_category in page_snapshots:
         for card in product_cards(soup):
             card_text = card.get_text(" ", strip=True)
             card_text = re.sub(r"[\u200b-\u200d\ufeff]", "", card_text)
             lower_card_text = card_text.lower()
-            if "kursi" not in lower_card_text:
-                continue
 
             discount_match = re.search(
                 r"\b\d+(?:[.,]\d+)?\s*%",
@@ -255,12 +288,6 @@ def scrape_ruparupa():
                     flags=re.IGNORECASE,
                 )
             )
-            has_discount_price = (
-                len(re.findall(r"Rp\s*[\d.]+", card_text)) >= 2
-            )
-
-            if has_promo_label and not discount_match and not has_discount_price:
-                continue
 
             href = card.get("href")
             if not href:
@@ -309,11 +336,12 @@ def scrape_ruparupa():
 
             rows.append({
                 "scraped_at": scraped_at,
-                "keyword": "kursi kerja",
+                "source_category": source_category,
                 "name": name,
                 "original_price": original_price,
                 "current_price": current_price,
                 "discount": discount,
+                "promotion": "Buy 1 Get 1" if has_promo_label else None,
                 "rating": rating,
                 "review_count": review_count,
                 "stock_status": stock_status,
